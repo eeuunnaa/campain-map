@@ -1,0 +1,135 @@
+# 체험단 마감 지도 - 6시간마다 새로 만들어서 GitHub Pages 에 올린다.
+# 폰에서 보낸 지역 요청(이슈 제목 '지역 추가: 부산' / '지역 빼기: 포항')도 처리한다.
+# (설명은 README.md 참고)
+name: 체험단 지도 갱신
+
+on:
+  schedule:
+    # 시간은 UTC 기준. 3,9,15,21시(UTC) = 한국 시간 12:17, 18:17, 00:17, 06:17
+    # (자정 직후에 한 번 돌아서 '오늘 마감'이 날짜 바뀌자마자 맞게 됨. GitHub 사정으로 몇 분~수십 분 늦을 수 있음)
+    - cron: '17 3,9,15,21 * * *'
+  workflow_dispatch:         # Actions 탭에서 [Run workflow] 로 바로 실행
+  push:
+    branches: [main]         # web_config.json 등을 고치면 바로 다시 만듦
+  issues:
+    types: [opened]          # 지도 화면의 [지역 추가 요청] 버튼으로 만든 이슈
+
+permissions:
+  contents: read
+
+# '한 번에 하나만 실행' 규칙은 실제로 일하는 job 에만 건다.
+# (워크플로 전체에 걸면, 다른 사람이 이슈를 마구 만들 때 그 실행들이 줄에 끼어서 기다리던 예약 갱신이 취소될 수 있음)
+
+jobs:
+  request:
+    # 저장소 주인이 쓴 '지역 추가: …' / '지역 빼기: …' 이슈만 반영한다.
+    # 다른 사람의 이슈는 여기서 바로 건너뛰어서 아무 작업도 하지 않는다. (자세한 판단은 request_region.py)
+    if: >-
+      github.event_name == 'issues' &&
+      github.event.issue.user.login == github.repository_owner &&
+      startsWith(github.event.issue.title, '지역')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:             # 요청이 연달아 와도 하나씩 처리 (web_config.json 저장이 겹치지 않게)
+      group: update-map-request
+      cancel-in-progress: false
+    permissions:
+      contents: write        # web_config.json 저장
+      issues: write          # 이슈에 답하고 닫기
+    outputs:
+      changed: ${{ steps.req.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 지역 요청 읽기
+        id: req
+        env:                 # 이슈 제목은 외부 입력이라 명령에 직접 넣지 않고 환경 변수로만 넘긴다
+          TITLE: ${{ github.event.issue.title }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          OWNER: ${{ github.repository_owner }}
+          PYTHONUTF8: '1'
+        run: python request_region.py
+
+      - name: web_config.json 저장
+        if: steps.req.outputs.changed == 'true'
+        env:
+          NUMBER: ${{ github.event.issue.number }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add web_config.json
+          git commit -m "지역 요청 반영 (#$NUMBER)"
+          git push
+
+      - name: 이슈에 답하고 닫기
+        if: steps.req.outputs.handled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NUMBER: ${{ github.event.issue.number }}
+          MESSAGE: ${{ steps.req.outputs.message }}
+        run: gh issue close "$NUMBER" --repo "$GITHUB_REPOSITORY" --comment "$MESSAGE"
+
+  build:
+    needs: request
+    # 예약·수동·push 실행은 항상, 이슈 실행은 지역 목록이 바뀌었을 때만 지도를 다시 만든다
+    if: ${{ !cancelled() && (github.event_name != 'issues' || needs.request.outputs.changed == 'true') }}
+    runs-on: ubuntu-latest
+    concurrency:             # 이전 지도 만들기가 안 끝났으면 기다렸다가 실행 (겹치지 않게)
+      group: update-map
+      cancel-in-progress: false
+    timeout-minutes: 300   # 큰 도시(부산·대전 등)를 처음 모을 때 2시간을 넘을 수 있어서 넉넉히
+    env:
+      TZ: Asia/Seoul
+      PYTHONUTF8: '1'
+      KAKAO_REST_KEY: ${{ secrets.KAKAO_REST_KEY }}   # 저장소 Secrets 에 넣은 카카오 키 (없어도 동작)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main          # 지역 요청으로 방금 바뀐 web_config.json 까지 받기
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 지난번에 찾아둔 위치 기록 불러오기
+        uses: actions/cache/restore@v4
+        with:
+          path: cache
+          key: map-cache-${{ github.run_id }}
+          restore-keys: map-cache-
+
+      - name: 지도 만들기
+        run: python build_web.py
+
+      - name: 위치 기록 저장 (다음 실행이 빨라지게)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: cache
+          key: map-cache-${{ github.run_id }}
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: update-map-deploy
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
